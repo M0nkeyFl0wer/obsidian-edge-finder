@@ -99,7 +99,6 @@ def _chordless_cycles(g: nx.Graph, max_len: int = 8, max_results: int = 5) -> li
         if key in seen:
             continue
         chord = False
-        members = set(cyc)
         for i, u in enumerate(cyc):
             for j, v in enumerate(cyc):
                 if j <= i:

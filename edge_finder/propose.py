@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
 
 from .cache import Cache, fingerprint, ontology_version, refresh_fingerprints
 from .index import TfIdfIndex

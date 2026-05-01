@@ -23,7 +23,6 @@ def _pct(num: int, denom: int) -> str:
 def _render_dimensions(fingerprints: list[Fingerprint]) -> str:
     """Render the cross-cutting dimensions sections (money, deadlines, stale, ideas, stack)."""
     parts: list[str] = []
-    fp_by_path = {fp.path: fp for fp in fingerprints}
 
     # 💰 Money
     money_fps = [fp for fp in fingerprints if fp.money]
@@ -257,7 +256,7 @@ def render_report(
         )
         for a, b, witness_count, witnesses in gaps.cocitations:
             cocitations_md += f"- `{a}` ↔ `{b}` (cited together by {witness_count} notes)\n"
-            cocitations_md += f"  witnesses: " + ", ".join(f"`{w}`" for w in witnesses) + "\n"
+            cocitations_md += "  witnesses: " + ", ".join(f"`{w}`" for w in witnesses) + "\n"
         cocitations_md += "\n"
 
     subclusters_md = ""

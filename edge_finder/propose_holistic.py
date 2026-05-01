@@ -14,12 +14,11 @@ Architecture:
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from dataclasses import asdict, dataclass
 
 import yaml
 
-from .cache import Cache, fingerprint as content_hash, ontology_version
+from .cache import Cache, ontology_version
 from .fingerprint import Fingerprint, fingerprint_completeness
 from .topology import build_graph
 from .walker import Note
@@ -86,7 +85,6 @@ def plan_holistic(
 ) -> tuple[HolisticPlanResult, str]:
     """Build the holistic judgment batch. Returns (result, batch_text)."""
     note_by_path = {n.relpath: n for n in notes}
-    fp_by_path = {fp.path: fp for fp in fingerprints}
 
     # Existing graph — give the LLM context on what's already linked
     g, _ = build_graph(notes)

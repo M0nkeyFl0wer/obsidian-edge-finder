@@ -18,7 +18,7 @@ from .shapes import draft_ontology, summarize_shapes
 from .stubs import detect_stub_corpora
 from .surprises import find_surprises
 from .topology import find_gaps
-from .triage import apply_plan, run_plan
+from .triage import apply_plan, run_create_hubs, run_plan, undo_last_triage
 from .verify import render_proposals_md, render_rejection_log, verify
 from .walker import walk_vault
 
@@ -296,13 +296,54 @@ def cmd_apply(vault_path: str, *, dry_run: bool, undo: bool, force: bool) -> int
     return 0 if not result.errors else 1
 
 
-def cmd_triage(vault_path: str, *, apply: bool, dry_run: bool) -> int:
+def cmd_triage(
+    vault_path: str,
+    *,
+    apply: bool,
+    dry_run: bool,
+    undo: bool,
+    force: bool,
+    create_hubs: bool,
+    min_tag_count: int,
+) -> int:
     vault = Path(vault_path).expanduser().resolve()
     if not vault.is_dir():
         print(f"error: {vault} is not a directory", file=sys.stderr)
         return 2
 
     plan_path = vault / "triage-plan.md"
+
+    if create_hubs:
+        phase = "DRY-RUN — preview only" if dry_run else "IMPLEMENT — generating hubs and attaching stubs"
+        print(f"\n==> CREATE-HUBS — {phase}\n", file=sys.stderr)
+        print(f"vault: {vault}", file=sys.stderr)
+        print(f"min stubs per tag: {min_tag_count}", file=sys.stderr)
+        plans, result = run_create_hubs(vault, min_tag_count=min_tag_count, dry_run=dry_run)
+        if not plans:
+            print(
+                f"\n  No tags found with ≥{min_tag_count} unattached stubs. "
+                f"Try a lower --min-tag-count or curate hub names manually.",
+                file=sys.stderr,
+            )
+            return 0
+        print(f"\n  hubs to create:    {len(plans)}", file=sys.stderr)
+        for p in plans[:10]:
+            print(f"    - {p.hub_filename} ← {len(p.stub_relpaths)} stubs (#{p.tag})", file=sys.stderr)
+        if len(plans) > 10:
+            print(f"    ... and {len(plans) - 10} more", file=sys.stderr)
+        print(f"  edges added:       {result.edges_added}", file=sys.stderr)
+        print(f"  files touched:     {result.files_touched}", file=sys.stderr)
+        if result.backup_path:
+            print(f"  backup written:    {result.backup_path}", file=sys.stderr)
+        for err in result.errors[:5]:
+            print(f"  ERROR: {err}", file=sys.stderr)
+        return 0
+
+    if undo:
+        print("\n==> UNDO — restoring vault from last triage backup\n", file=sys.stderr)
+        ok, msg = undo_last_triage(vault, force=force)
+        print(f"  {msg}", file=sys.stderr)
+        return 0 if ok else 1
 
     if apply:
         phase = "DRY-RUN — preview only, no mutations" if dry_run else "IMPLEMENT — mutating stub notes"
@@ -328,6 +369,24 @@ def cmd_triage(vault_path: str, *, apply: bool, dry_run: bool) -> int:
     print(f"  attachments proposed:  {len(plan.attachments)}", file=sys.stderr)
     print(f"  unattached stubs:      {len(plan.unattached)}", file=sys.stderr)
     print(f"\nwrote {out}", file=sys.stderr)
+
+    if plan.n_hubs == 0 and plan.n_stubs > 0:
+        print("", file=sys.stderr)
+        print("⚠️  No hub-shaped notes found in your vault.", file=sys.stderr)
+        print("    Hub detection looks for filenames matching:", file=sys.stderr)
+        print("      *Kanban*, *Index*, *Overview*, *Hub*, *Map*, *Catalog*, *Directory*", file=sys.stderr)
+        print("    outside content folders (books/, web-clips/, Clippings/, etc).", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("    To get hub-attach working:", file=sys.stderr)
+        print("      1) Create one or more topical hub notes named e.g.", file=sys.stderr)
+        print("         `Climate Hub.md` or `Crypto Index.md` in the vault root.", file=sys.stderr)
+        print("      2) Re-run `edge-finder triage <vault>` and your stubs will", file=sys.stderr)
+        print("         attach to whichever hub matches their tags.", file=sys.stderr)
+        print("    Or skip the manual step and run:", file=sys.stderr)
+        print(f"      edge-finder triage --create-hubs {vault}", file=sys.stderr)
+        print("    to auto-generate hubs from common tags in your stubs.", file=sys.stderr)
+        return 0
+
     print(f"\n==> CONFIRM — review {out.name}, uncheck anything you don't want,", file=sys.stderr)
     print(f"    then run: edge-finder triage --apply {vault}\n", file=sys.stderr)
     return 0
@@ -375,6 +434,14 @@ def main(argv: list[str] | None = None) -> int:
                           help="apply the checked attachments from triage-plan.md")
     triage_p.add_argument("--dry-run", action="store_true",
                           help="(with --apply) show what would change without modifying any notes")
+    triage_p.add_argument("--undo", action="store_true",
+                          help="restore the vault from the most recent triage backup")
+    triage_p.add_argument("--force", action="store_true",
+                          help="(with --undo) overwrite even if files have been edited since the last triage")
+    triage_p.add_argument("--create-hubs", action="store_true",
+                          help="auto-generate hub notes for common tags in unattached stubs")
+    triage_p.add_argument("--min-tag-count", type=int, default=20,
+                          help="(with --create-hubs) minimum stubs per tag to justify generating a hub")
 
     args = parser.parse_args(argv)
     if args.cmd == "scan":
@@ -384,7 +451,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "apply":
         return cmd_apply(args.vault, dry_run=args.dry_run, undo=args.undo, force=args.force)
     if args.cmd == "triage":
-        return cmd_triage(args.vault, apply=args.apply, dry_run=args.dry_run)
+        return cmd_triage(
+            args.vault,
+            apply=args.apply,
+            dry_run=args.dry_run,
+            undo=args.undo,
+            force=args.force,
+            create_hubs=args.create_hubs,
+            min_tag_count=args.min_tag_count,
+        )
     if args.cmd == "propose":
         if args.judge:
             print("--judge is not yet implemented; coming after we validate --plan output", file=sys.stderr)

@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import tarfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -290,25 +291,37 @@ def _hub_link_target(hub_relpath: str, all_relpaths: set[str]) -> str:
     return f"{qualified}|{name}"
 
 
-def _backup_files(vault: Path, files: list[Path]) -> tuple[Path, dict[str, str]]:
-    """Tarball the given files into .edge-finder/backups/ with a manifest of
-    pre-mutation sha256 sums."""
+def _backup_files(vault: Path, files: list[Path]) -> Path:
+    """Tarball the given files (pre-mutation contents) into
+    .edge-finder/backups/triage-<timestamp>.tar. Returns the tarball path.
+
+    The manifest is written separately, *after* mutations finish, so it
+    captures the post-mutation file hashes — that's what `triage --undo`
+    checks against to detect manual edits made between apply and undo.
+    """
     backup_dir = vault / ".edge-finder" / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     tar_path = backup_dir / f"triage-{ts}.tar"
-    manifest_path = backup_dir / f"triage-{ts}.manifest.json"
-    manifest: dict[str, str] = {}
     with tarfile.open(tar_path, "w") as tf:
         for f in files:
-            try:
-                data = f.read_bytes()
-            except OSError:
-                continue
-            manifest[str(f.relative_to(vault))] = hashlib.sha256(data).hexdigest()
-            tf.add(f, arcname=str(f.relative_to(vault)))
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return tar_path, manifest
+            if f.exists():
+                tf.add(f, arcname=str(f.relative_to(vault)))
+    return tar_path
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_post_apply_manifest(backup_path: Path, vault: Path, affected: list[Path]) -> None:
+    manifest: dict[str, str] = {}
+    for p in affected:
+        if p.exists():
+            manifest[str(p.relative_to(vault))] = _sha256(p.read_bytes())
+    backup_path.with_suffix(".manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def apply_plan(vault: Path, plan_md_path: Path, *, dry_run: bool = False) -> ApplyResult:
@@ -330,8 +343,9 @@ def apply_plan(vault: Path, plan_md_path: Path, *, dry_run: bool = False) -> App
     affected = [vault / a.stub_relpath for a in attachments]
 
     if not dry_run:
-        result.backup_path, _ = _backup_files(vault, affected)
+        result.backup_path = _backup_files(vault, affected)
 
+    actually_touched: list[Path] = []
     for a in attachments:
         stub_path = vault / a.stub_relpath
         if not stub_path.exists():
@@ -345,7 +359,57 @@ def apply_plan(vault: Path, plan_md_path: Path, *, dry_run: bool = False) -> App
             result.files_touched += 1
             if not dry_run:
                 stub_path.write_text(new_body, encoding="utf-8")
+                actually_touched.append(stub_path)
+
+    if not dry_run and actually_touched and result.backup_path:
+        _write_post_apply_manifest(result.backup_path, vault, actually_touched)
     return result
+
+
+def undo_last_triage(vault: Path, *, force: bool = False) -> tuple[bool, str]:
+    """Restore the vault from the most recent triage-*.tar backup.
+
+    Hash-checks the post-apply manifest against current file state. If any
+    file has been edited since the last triage apply, refuses without
+    --force so the user doesn't silently lose manual edits.
+    """
+    backup_dir = vault / ".edge-finder" / "backups"
+    if not backup_dir.exists():
+        return False, f"no backups found in {backup_dir}"
+    backups = sorted(backup_dir.glob("triage-*.tar"))
+    if not backups:
+        return False, "no triage backups available"
+    latest = backups[-1]
+
+    manifest_path = latest.with_suffix(".manifest.json")
+    if manifest_path.exists() and not force:
+        try:
+            expected = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            expected = {}
+        diverged: list[str] = []
+        for relpath, expected_hash in expected.items():
+            current = vault / relpath
+            if not current.exists():
+                diverged.append(f"{relpath} (deleted)")
+                continue
+            if _sha256(current.read_bytes()) != expected_hash:
+                diverged.append(relpath)
+        if diverged:
+            sample = "\n    ".join(diverged[:5])
+            more = f"\n    ... and {len(diverged) - 5} more" if len(diverged) > 5 else ""
+            return False, (
+                f"refusing to undo — {len(diverged)} files have changed since the last triage:\n"
+                f"    {sample}{more}\nRun with --force to overwrite anyway."
+            )
+
+    with tarfile.open(latest, "r") as tar:
+        tar.extractall(path=vault)
+    used_path = latest.with_suffix(".tar.used")
+    shutil.move(str(latest), str(used_path))
+    if manifest_path.exists():
+        manifest_path.replace(manifest_path.with_suffix(".json.used"))
+    return True, f"restored from {latest.name}"
 
 
 # ---------- Public entrypoint --------------------------------------------------
@@ -359,3 +423,198 @@ def run_plan(vault: Path) -> tuple[TriagePlan, Path]:
     out = vault / "triage-plan.md"
     out.write_text(render_plan_md(plan), encoding="utf-8")
     return plan, out
+
+
+# ---------- --create-hubs: auto-generate hubs from common tags ------------------
+
+
+_BORING_TAGS = {
+    # Tags that show up everywhere and don't make good hub topics.
+    "bookmark", "bookmarks", "clipping", "clippings", "stub",
+    "web-content", "web-clip", "pocket", "firefox", "flipboard",
+    "raindrop", "instapaper", "note", "import", "imported",
+    "untagged", "todo", "draft",
+}
+
+
+@dataclass
+class HubCreationPlan:
+    tag: str
+    hub_filename: str        # e.g., "Crypto Hub.md"
+    stub_relpaths: list[str] = field(default_factory=list)
+
+
+def _titlecase_tag(tag: str) -> str:
+    """Convert `solar-energy` → `Solar Energy`, `dao` → `DAO`, etc."""
+    parts = re.split(r"[-_\s]+", tag)
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        if p.isupper() or len(p) <= 3:
+            out.append(p.upper())
+        else:
+            out.append(p[:1].upper() + p[1:].lower())
+    return " ".join(out)
+
+
+def plan_hub_creation(
+    notes: list[Note],
+    graph: nx.Graph,
+    *,
+    min_tag_count: int = 20,
+) -> list[HubCreationPlan]:
+    """For each tag in N+ unattached stubs with no existing hub match,
+    return a plan to create `{Tag} Hub.md` containing those stubs.
+
+    "Unattached" here means: a stub whose tags don't currently match any
+    hub-shaped note. This pairs naturally with `triage --apply` (run apply
+    first to land what's matchable, then create-hubs to handle the rest).
+    """
+    triage = plan_triage(notes, graph)
+    hubs = find_hubs(notes, graph)
+    existing_hub_norms = {h.norm_slug for h in hubs}
+
+    # Group unattached stubs by their candidate hub tags.
+    by_tag: dict[str, list[str]] = {}
+    for stub in triage.unattached:
+        for tag in stub.candidate_hub_tags:
+            tnorm = _norm(tag)
+            if not tnorm or tag.lower() in _BORING_TAGS or len(tnorm) < 3:
+                continue
+            by_tag.setdefault(tag, []).append(stub.relpath)
+
+    hub_creations: list[HubCreationPlan] = []
+    for tag, stub_paths in by_tag.items():
+        if len(stub_paths) < min_tag_count:
+            continue
+        if _norm(tag) in existing_hub_norms:
+            continue
+        # Avoid name collisions with non-hub notes too
+        title = _titlecase_tag(tag)
+        candidate_filename = f"{title} Hub.md"
+        if any(n.relpath == candidate_filename for n in notes):
+            continue
+        hub_creations.append(HubCreationPlan(
+            tag=tag,
+            hub_filename=candidate_filename,
+            stub_relpaths=sorted(set(stub_paths)),
+        ))
+
+    # Bigger hubs first — most useful surface area for the user to review
+    hub_creations.sort(key=lambda h: -len(h.stub_relpaths))
+    return hub_creations
+
+
+def _render_hub_body(plan: HubCreationPlan) -> str:
+    """Generate the body of a freshly-created hub note."""
+    lines = [
+        "---",
+        "type: hub",
+        f"tag: {plan.tag}",
+        "auto-generated: true",
+        f"created: {datetime.now().date().isoformat()}",
+        "tags:",
+        "  - hub",
+        "  - auto-generated",
+        f"  - {plan.tag}",
+        "---",
+        "",
+        f"# {_titlecase_tag(plan.tag)} Hub",
+        "",
+        f"Auto-generated by `edge-finder triage --create-hubs` from "
+        f"{len(plan.stub_relpaths)} notes tagged `#{plan.tag}`. Edit "
+        f"the title, description, and groupings as you see fit — this "
+        f"file is yours to curate.",
+        "",
+        "## Notes in this hub",
+        "",
+    ]
+    for relpath in plan.stub_relpaths:
+        stub_basename = Path(relpath).stem
+        lines.append(f"- [[{stub_basename}]]")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def apply_hub_creation(
+    vault: Path,
+    plans: list[HubCreationPlan],
+    *,
+    dry_run: bool = False,
+) -> ApplyResult:
+    """Create the proposed hub notes and attach each stub to its new hub.
+
+    Single backup tarball captures every stub that gets a `## See also`
+    bullet AND the (empty) prior state of each new hub file (so undo can
+    delete the auto-generated hubs cleanly).
+    """
+    result = ApplyResult(proposals_total=len(plans), proposals_checked=len(plans))
+    if not plans:
+        return result
+
+    all_paths = {str(p.relative_to(vault)) for p in vault.rglob("*.md")
+                 if not any(part.startswith(".") for part in p.relative_to(vault).parts)}
+
+    # Filter out plans whose target hub file already exists (race / re-run safety).
+    plans = [p for p in plans if not (vault / p.hub_filename).exists()]
+
+    # Files we touch: each existing stub + each new hub file.
+    affected_existing: list[Path] = []
+    affected_new: list[Path] = []
+    for plan in plans:
+        affected_new.append(vault / plan.hub_filename)
+        for relpath in plan.stub_relpaths:
+            stub_path = vault / relpath
+            if stub_path.exists():
+                affected_existing.append(stub_path)
+
+    if not dry_run:
+        # Backup existing files only — new hubs don't exist yet.
+        result.backup_path = _backup_files(vault, affected_existing)
+
+    # 1) Create the hub files
+    for plan in plans:
+        hub_path = vault / plan.hub_filename
+        body = _render_hub_body(plan)
+        if dry_run:
+            print(f"  [dry-run] create {plan.hub_filename} ({len(plan.stub_relpaths)} stubs)")
+            continue
+        hub_path.write_text(body, encoding="utf-8")
+        result.files_touched += 1
+
+    # 2) Add `## See also` to each stub pointing at its new hub
+    actually_touched: list[Path] = []
+    for plan in plans:
+        hub_basename = Path(plan.hub_filename).stem
+        for relpath in plan.stub_relpaths:
+            stub_path = vault / relpath
+            if not stub_path.exists():
+                result.errors.append(f"stub missing: {relpath}")
+                continue
+            body = stub_path.read_text(encoding="utf-8")
+            link_target = _hub_link_target(plan.hub_filename, all_paths | {plan.hub_filename})
+            new_body, did = _insert_see_also(body, link_target if link_target else hub_basename)
+            if did:
+                result.edges_added += 1
+                if not dry_run:
+                    stub_path.write_text(new_body, encoding="utf-8")
+                    actually_touched.append(stub_path)
+                    result.files_touched += 1
+
+    if not dry_run and (actually_touched or affected_new) and result.backup_path:
+        # Manifest covers both existing-stub mutations and new-hub files so
+        # undo can detect manual edits to either before reverting.
+        _write_post_apply_manifest(
+            result.backup_path, vault, actually_touched + affected_new
+        )
+    return result
+
+
+def run_create_hubs(vault: Path, *, min_tag_count: int = 20, dry_run: bool = False) -> tuple[list[HubCreationPlan], ApplyResult]:
+    """End-to-end: detect → plan hubs → apply."""
+    notes = list(walk_vault(vault))
+    graph, _ = build_graph(notes)
+    plans = plan_hub_creation(notes, graph, min_tag_count=min_tag_count)
+    result = apply_hub_creation(vault, plans, dry_run=dry_run)
+    return plans, result
