@@ -18,6 +18,14 @@ from .shapes import draft_ontology, summarize_shapes
 from .stubs import detect_stub_corpora
 from .surprises import find_surprises
 from .topology import find_gaps
+from .interview import (
+    build_questions,
+    compose_vault_layer,
+    gather_signals,
+    parse_answers,
+    render_interview_md,
+)
+from .ontology import save_vault_ontology
 from .triage import apply_plan, run_create_hubs, run_plan, undo_last_triage
 from .verify import render_proposals_md, render_rejection_log, verify
 from .walker import walk_vault
@@ -296,6 +304,73 @@ def cmd_apply(vault_path: str, *, dry_run: bool, undo: bool, force: bool) -> int
     return 0 if not result.errors else 1
 
 
+def cmd_ontology(vault_path: str, *, apply: bool) -> int:
+    vault = Path(vault_path).expanduser().resolve()
+    if not vault.is_dir():
+        print(f"error: {vault} is not a directory", file=sys.stderr)
+        return 2
+
+    interview_path = vault / "interview-prep.md"
+
+    if apply:
+        print("\n==> APPLY — composing vault ontology from interview answers\n", file=sys.stderr)
+        if not interview_path.exists():
+            print(
+                f"error: {interview_path} not found — run `edge-finder ontology` first",
+                file=sys.stderr,
+            )
+            return 1
+        # Re-derive questions so IDs match
+        notes = list(walk_vault(vault))
+        signals = gather_signals(notes)
+        questions = build_questions(signals)
+        accepted = parse_answers(interview_path.read_text(encoding="utf-8"), questions)
+        if not accepted:
+            print(
+                "  no boxes checked in interview-prep.md — nothing to compose. "
+                "Edit the file and re-run.",
+                file=sys.stderr,
+            )
+            return 0
+        layer = compose_vault_layer(accepted)
+        out = save_vault_ontology(vault, layer)
+        print(f"  accepted offers: {len(accepted)}", file=sys.stderr)
+        kinds: dict[str, int] = {}
+        for q in accepted:
+            kinds[q.kind] = kinds.get(q.kind, 0) + 1
+        for k, v in kinds.items():
+            print(f"    - {k}: {v}", file=sys.stderr)
+        print(f"\nwrote {out}", file=sys.stderr)
+        print(
+            f"\n==> NEXT — the composed ontology now governs `triage` and "
+            f"`apply`.\n    Re-run `edge-finder scan {vault}` to see the "
+            f"effective schema reflected in the report.\n",
+            file=sys.stderr,
+        )
+        return 0
+
+    print("\n==> INTERVIEW — gathering signals from your vault\n", file=sys.stderr)
+    print(f"vault: {vault}", file=sys.stderr)
+    notes = list(walk_vault(vault))
+    signals = gather_signals(notes)
+    questions = build_questions(signals)
+    print(f"  notes:               {signals.n_notes}", file=sys.stderr)
+    print(f"  granola-shaped:      {round(100*signals.granola_share)}%", file=sys.stderr)
+    print(f"  URL-stub-shaped:     {round(100*signals.stub_share)}%", file=sys.stderr)
+    print(f"  distinct types:      {len(signals.type_counts)}", file=sys.stderr)
+    print(f"  questions to answer: {len(questions)}", file=sys.stderr)
+
+    interview_path.write_text(render_interview_md(signals, questions), encoding="utf-8")
+    print(f"\nwrote {interview_path}", file=sys.stderr)
+    print(
+        f"\n==> CONFIRM — review {interview_path.name}, check the boxes you "
+        f"want, uncheck the rest, then run:\n"
+        f"    edge-finder ontology --apply {vault}\n",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_triage(
     vault_path: str,
     *,
@@ -428,6 +503,11 @@ def main(argv: list[str] | None = None) -> int:
     apply_p.add_argument("--force", action="store_true",
                          help="(with --undo) overwrite even if files have been edited since apply")
 
+    onto_p = sub.add_parser("ontology", help="conduct the ontology interview to compose a vault-specific schema")
+    onto_p.add_argument("vault", help="path to the Obsidian vault root")
+    onto_p.add_argument("--apply", action="store_true",
+                        help="read interview-prep.md and write .edge-finder/ontology.yaml")
+
     triage_p = sub.add_parser("triage", help="propose hub-attach edges for stub notes (bookmark imports etc.)")
     triage_p.add_argument("vault", help="path to the Obsidian vault root")
     triage_p.add_argument("--apply", action="store_true",
@@ -450,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_verify(args.vault)
     if args.cmd == "apply":
         return cmd_apply(args.vault, dry_run=args.dry_run, undo=args.undo, force=args.force)
+    if args.cmd == "ontology":
+        return cmd_ontology(args.vault, apply=args.apply)
     if args.cmd == "triage":
         return cmd_triage(
             args.vault,
