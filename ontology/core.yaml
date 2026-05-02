@@ -1,0 +1,167 @@
+# obsidian-edge-finder — CORE ONTOLOGY (v1)
+#
+# This is the universal layer: predicates and node types that any
+# Obsidian vault using edge-finder is expected to support. Vault-shape
+# profiles (see ./profiles/) extend this with predicates and types
+# specific to particular vault shapes (Granola meeting notes, bookmark
+# imports, research wikis, etc).
+#
+# A vault's actual ontology is composed at scan time:
+#   1. Start from this core
+#   2. Layer the matching profile (auto-detected from vault shape)
+#   3. Layer the vault's own `.edge-finder/ontology.yaml` (if present)
+#
+# The composed result is what edge-finder's apply step validates against.
+
+version: 1.0
+layer: core
+
+# ---------- UNIVERSAL NODE TYPES ----------
+#
+# Every Obsidian vault has these. Profiles add more.
+
+node_types:
+
+  - name: note
+    description: |
+      The most general subject — any markdown file. Acts as the root
+      type. Other types are subtypes of `note`.
+    parent_type: null
+
+  - name: hub
+    description: |
+      An index / topic-aggregator note. Edge-finder identifies these
+      by filename pattern (matching one of the hub_name_patterns
+      below) outside content folders.
+    parent_type: note
+    hub_name_patterns:
+      - "*Kanban*"
+      - "*Index*"
+      - "*Overview*"
+      - "*Hub*"
+      - "*Map*"
+      - "*Catalog*"
+      - "*Directory*"
+    excluded_folders:
+      - books
+      - web-clips
+      - Clippings
+      - daily
+      - Daily
+      - Templates
+
+  - name: person
+    description: |
+      A person entity — author, contact, attendee, or any human
+      referenced via `[[Wikilink]]` form.
+    parent_type: note
+
+  - name: org
+    description: |
+      An organization, publisher, outlet, or institution.
+    parent_type: note
+
+  - name: concept
+    description: |
+      An abstract topic or concept. Often implicit in tags before
+      being promoted to a first-class note.
+    parent_type: note
+
+  - name: project
+    description: |
+      Project documentation — scope, goals, status. Vault-specific
+      profiles may subtype this further.
+    parent_type: note
+
+# ---------- UNIVERSAL PREDICATES ----------
+#
+# These are valid in every vault. Domain/range constraints reference
+# the universal types; profiles can extend the domain/range to include
+# their specific subtypes.
+
+predicates:
+
+  - name: topic_hub
+    description: |
+      Subject is about the topic represented by Object (a hub).
+      Replaces the bare-wikilink "## See also" pattern with a
+      typed predicate.
+    inverse: contains
+    domain: [note]
+    range: [hub]
+    multiple: true
+
+  - name: co_topic
+    description: |
+      Subject and Object share topical scope without a more specific
+      relationship. Fallback predicate when neither same_initiative
+      nor same_org applies.
+    inverse: co_topic
+    symmetric: true
+    domain: [note]
+    range: [note]
+    multiple: true
+
+  - name: same_org
+    description: |
+      Subject and Object are published by, owned by, or about the
+      same organization.
+    inverse: same_org
+    symmetric: true
+    domain: [note]
+    range: [note]
+    multiple: true
+
+  - name: cites
+    description: |
+      Subject explicitly references Object as a source. Asymmetric —
+      citation has direction.
+    inverse: cited_by
+    domain: [note]
+    range: [note]
+    multiple: true
+
+  - name: discusses
+    description: |
+      Subject covers the concept or topic Object. For body-bearing
+      notes pointing at concepts/hubs.
+    inverse: discussed_in
+    domain: [note]
+    range: [concept, hub]
+    multiple: true
+
+  - name: authored_by
+    description: |
+      Subject was written by Object (a person).
+    inverse: authored
+    domain: [note]
+    range: [person]
+    multiple: true
+
+  - name: published_in
+    description: |
+      Subject was published in Object (an organization / outlet).
+    inverse: publishes
+    domain: [note]
+    range: [org]
+    multiple: false
+
+# ---------- VALIDATION ----------
+
+validation:
+  reject_self_edges: true
+  reject_already_present: true
+  reject_out_of_range: true
+  warn_orphan_concept_targets: true
+  warn_orphan_person_targets: true
+
+# ---------- EVOLUTION POLICY ----------
+#
+# How the ontology grows. Edge-finder surfaces these as conversation,
+# never auto-applies.
+
+evolution:
+  promote_concept_threshold: 10
+  promote_org_threshold: 5
+  predicate_addition: requires-conversation
+  node_type_addition: requires-conversation

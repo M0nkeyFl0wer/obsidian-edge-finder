@@ -1,0 +1,165 @@
+# Reference profile: Granola meeting-notes vault
+#
+# This is REFERENCE / INSPIRATION, not an auto-applied default.
+# Edge-finder NEVER applies a profile based on a vault-shape trigger
+# alone — the user's ontology is composed through the interview flow
+# (see ../INTERVIEW.md). During that interview, the tool may surface
+# pieces of this profile as candidates ("I see Granola-style meetings
+# — want me to add `attended_by` and `follows_up_on`?") and the user
+# accepts or rejects each one.
+#
+# This file documents what a typical Granola-shaped vault's ontology
+# could look like once composed. It is also the source the interview
+# pulls candidate offers from when it detects Granola-shaped notes
+# (sections like `## Summary` / `## Attendees`).
+
+version: 1.0
+layer: reference-profile  # not auto-applied
+extends: core
+applies_to:
+  description: |
+    Vaults dominated by Granola-style meeting transcripts.
+  detection_signals:
+    - has_section: "## Summary"
+    - has_section: "## Attendees"
+    - granola_share_in_scan_output: ">= 0.30"
+
+node_types:
+
+  - name: meeting
+    description: |
+      A Granola-style meeting note. Detected by structured sections
+      (`## Summary`, `## Attendees`) and/or filename pattern. Body
+      typically contains transcript and summary.
+    parent_type: note
+    inferred_from:
+      - has_section: "## Summary"
+      - has_section: "## Attendees"
+      - filename_pattern: '\d{4}-\d{2}-\d{2}.*'
+
+  - name: action_item
+    description: |
+      A discrete task captured during a meeting. Often listed under
+      a `## Action Items` section. May be promoted to a first-class
+      note via Templater.
+    parent_type: note
+    inferred_from:
+      - frontmatter_type: action_item
+      - parent_section_in_meeting: "## Action Items"
+
+  - name: decision
+    description: |
+      A recorded decision made during a meeting.
+    parent_type: note
+    inferred_from:
+      - frontmatter_type: decision
+      - parent_section_in_meeting: "## Decisions"
+
+  - name: topic
+    description: |
+      A meeting subject or recurring conversation thread. Often
+      surfaces as a tag before being promoted to a hub.
+    parent_type: concept
+
+predicates:
+
+  - name: attended_by
+    description: |
+      Subject is a meeting attended by Object (a person).
+    inverse: attended
+    domain: [meeting]
+    range: [person]
+    multiple: true
+
+  - name: follows_up_on
+    description: |
+      Subject (a meeting) is a follow-up to Object (an earlier
+      meeting). Detects from filename date ordering + topic overlap.
+    inverse: followed_up_by
+    domain: [meeting]
+    range: [meeting]
+    multiple: true
+
+  - name: decided
+    description: |
+      Subject (a meeting) recorded the decision Object.
+    inverse: decided_in
+    domain: [meeting]
+    range: [decision]
+    multiple: true
+
+  - name: assigned_to
+    description: |
+      Subject (an action item) is assigned to Object (a person).
+    inverse: assigned
+    domain: [action_item]
+    range: [person]
+    multiple: true   # an action can have multiple owners
+
+  - name: derived_from
+    description: |
+      Subject (an action item or decision) was created in / derived
+      from Object (a meeting).
+    inverse: produced
+    domain: [action_item, decision]
+    range: [meeting]
+    multiple: false
+
+  - name: owned_by
+    description: |
+      Subject (a project) is owned/led by Object (a person).
+    inverse: owns
+    domain: [project]
+    range: [person]
+    multiple: true
+
+  # Override `discusses` from core to widen the range to include
+  # `topic` and `project` (Granola meetings discuss projects, not just
+  # concepts/hubs).
+  - name: discusses
+    description: |
+      Subject (a meeting) covers Object (a project, topic, or concept).
+    inverse: discussed_in
+    domain: [meeting]
+    range: [project, topic, concept, hub]
+    multiple: true
+    overrides_core: true
+
+# ---------- EXAMPLE QUERIES ----------
+#
+# Multi-hop reasoning queries this profile makes possible. Written in
+# Dataview syntax. These are illustrative; the tool ships them as
+# examples in the user's vault under `Examples/Reasoning Queries.md`
+# when this profile is selected.
+
+example_queries:
+
+  - name: "Action items for [Person] from meetings about [Project]"
+    description: |
+      2-hop: action_item → derived_from → meeting → discusses → project
+    dataview: |
+      TABLE assigned_to AS "Owner", derived_from AS "From meeting"
+      FROM ""
+      WHERE type = "action_item"
+        AND contains(assigned_to, [[Some Person]])
+        AND any(file(derived_from).discusses, p => p = [[Some Project]])
+
+  - name: "Decisions in follow-up meetings to [Kickoff Meeting]"
+    description: |
+      2-hop: meeting → follows_up_on → meeting → decided → decision
+    dataview: |
+      TABLE decided AS "Decisions"
+      FROM ""
+      WHERE type = "meeting"
+        AND contains(follows_up_on, [[Kickoff Meeting]])
+        AND decided
+
+  - name: "Topics discussed across all meetings owned by [Project]"
+    description: |
+      2-hop: project → discussed_in → meeting → discusses → topic
+    dataview: |
+      TABLE distinct(discusses) AS "Topics"
+      FROM ""
+      WHERE type = "meeting"
+        AND any(discusses, t => t = [[Some Project]])
+      FLATTEN discusses AS topic

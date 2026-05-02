@@ -1,0 +1,102 @@
+# Reference profile: Bookmark-import vault
+#
+# This is REFERENCE / INSPIRATION, not an auto-applied default.
+# Edge-finder NEVER applies a profile based on a vault-shape trigger
+# alone — the user's ontology is composed through the interview flow
+# (see ../INTERVIEW.md). During that interview, the tool may surface
+# pieces of this profile as candidates and the user accepts or
+# rejects each one.
+
+version: 1.0
+layer: reference-profile  # not auto-applied
+extends: core
+applies_to:
+  description: |
+    Vaults dominated by URL imports from Pocket / Raindrop /
+    Instapaper / Notion / browser bookmarks. Notes are mostly URL
+    stubs with frontmatter `url:` and minimal body content.
+  detection_signals:
+    - frontmatter_has_url_share: ">= 0.30"
+    - stub_share_in_scan_output: ">= 0.30"
+
+node_types:
+
+  - name: bookmark
+    description: |
+      A URL-stub note from a bookmark import. Has frontmatter `url:`,
+      no body content. Edge-finder's triage subcommand specifically
+      targets this type for hub-attach.
+    parent_type: note
+    inferred_from:
+      - frontmatter_type: bookmark
+      - frontmatter_url_present: true
+      - body_word_count_lt: 50
+
+  - name: clipping
+    description: |
+      A full-body web capture (Obsidian Web Clipper output). Has
+      frontmatter `source:` URL, body contains article text.
+    parent_type: bookmark
+    inferred_from:
+      - folder: Clippings/
+      - frontmatter_source_url: true
+      - body_word_count_gte: 200
+
+  - name: book-review
+    description: |
+      A book entry — title, author, publisher, isbn, status.
+    parent_type: note
+    inferred_from:
+      - frontmatter_type: book-review
+      - folder: books/
+
+predicates:
+
+  - name: same_initiative
+    description: |
+      Subject and Object are about the same named initiative, event,
+      or coordinated effort (e.g., "Crypto Climate Accord").
+    inverse: same_initiative
+    symmetric: true
+    domain: [bookmark, clipping, project]
+    range: [bookmark, clipping, project]
+    multiple: true
+
+  # Widen `same_org` from core to explicitly include bookmarks/
+  # clippings as both domain and range.
+  - name: same_org
+    description: |
+      Subject and Object are published by or about the same
+      organization (typical for clipping-from-publisher overlap).
+    inverse: same_org
+    symmetric: true
+    domain: [bookmark, clipping, book-review, project]
+    range: [bookmark, clipping, book-review, project, org]
+    multiple: true
+    overrides_core: true
+
+example_queries:
+
+  - name: "Climate-tagged bookmarks from publishers with book-review coverage"
+    description: |
+      2-hop: bookmark → topic_hub → climate; bookmark → published_in →
+      org ← published_in ← book-review
+    dataview: |
+      TABLE published_in AS "Publisher"
+      FROM "web-clips" OR "Clippings"
+      WHERE topic_hub = [[Climate Hub]]
+        AND published_in
+        AND length(file(published_in).inlinks.where(l => l.type = "book-review")) > 0
+
+  - name: "Authors with both bookmarks and book-reviews"
+    description: |
+      Authors who appear as `authored_by` target on both a bookmark/
+      clipping and a book-review. Useful for finding curated thinkers.
+    dataview: |
+      TABLE distinct(authored_by) AS "Author"
+      FROM ""
+      WHERE authored_by
+      GROUP BY authored_by
+      WHERE
+        length(rows.file.where(f => f.type = "bookmark" OR f.type = "clipping")) > 0
+        AND length(rows.file.where(f => f.type = "book-review")) > 0
