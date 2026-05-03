@@ -37,7 +37,7 @@ from .ontology import Ontology, load_vault_ontology
 from .topology import build_graph
 from .triage import find_hubs
 from .typed_edges import infer_note_type, insert_typed_edge
-from .walker import Note, walk_vault
+from .walker import walk_vault
 
 _HEADING_RE = re.compile(r"^##\s+\d+\.\s+`([^`]+)`\s*(→|↔)\s*`([^`]+)`\s*$", re.MULTILINE)
 _CHECKBOX_RE = re.compile(
