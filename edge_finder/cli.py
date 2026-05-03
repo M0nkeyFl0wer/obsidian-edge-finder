@@ -170,6 +170,21 @@ def cmd_propose_plan(
         print(f"    then run: edge-finder apply {vault}\n", file=sys.stderr)
         return 0
 
+    if mode == "clusters":
+        print("\n==> ASSESS — cluster-based triplet closure (no LLM)\n", file=sys.stderr)
+        print(f"vault: {vault}", file=sys.stderr)
+        print(f"  {len(notes)} notes parsed", file=sys.stderr)
+        composed = load_vault_ontology(vault)
+        from .propose_clusters import plan_cluster_proposals, write_cluster_proposals_md
+        proposals = plan_cluster_proposals(notes, composed)
+        out_path = vault / "proposals.md"
+        write_cluster_proposals_md(proposals, out_path)
+        print(f"  cluster closures:    {len(proposals)}", file=sys.stderr)
+        print(f"\nwrote {out_path}", file=sys.stderr)
+        print("==> CONFIRM — review proposals.md, uncheck anything you don't want,", file=sys.stderr)
+        print(f"    then run: edge-finder apply {vault}\n", file=sys.stderr)
+        return 0
+
     if mode == "lean":
         print("\n==> ASSESS — TF-IDF candidate generation (no LLM, lean mode)\n", file=sys.stderr)
         print(f"vault: {vault}", file=sys.stderr)
@@ -504,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
                          help="assess + plan candidates only (no LLM call)")
     propose.add_argument("--judge", action="store_true",
                          help="run the LLM judgment step (not yet implemented)")
-    propose.add_argument("--mode", choices=["holistic", "lean", "topology"], default="holistic",
+    propose.add_argument("--mode", choices=["holistic", "lean", "topology", "clusters"], default="holistic",
                          help="holistic: structured-index → Claude (default); lean: TF-IDF + per-pair judgment; topology: deterministic triplet closure")
     propose.add_argument("-k", type=int, default=10,
                          help="(lean only) max candidates per source note")
