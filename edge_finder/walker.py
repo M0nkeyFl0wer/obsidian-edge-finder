@@ -14,8 +14,8 @@ from typing import Iterator
 
 import yaml
 
-EXCLUDE_DIRS = {".obsidian", ".trash", ".git", "node_modules", ".edge-finder", ".stversions"}
-EXCLUDE_FILES = {"vault-report.md", "proposals.md", "judgment-batch.md"}
+EXCLUDE_DIRS = {".obsidian", ".trash", ".git", "node_modules", ".edge-finder", ".stversions", "Templates"}
+EXCLUDE_FILES = {"vault-report.md", "proposals.md", "judgment-batch.md", "triage-plan.md", "interview-prep.md"}
 
 WIKILINK_RE = re.compile(r"\[\[([^\]\|\#]+)(?:#[^\]\|]+)?(?:\|[^\]]+)?\]\]")
 TAG_RE = re.compile(r"(?:^|\s)#([A-Za-z][\w/-]*)")
@@ -140,7 +140,7 @@ def walk_vault(vault_root: Path) -> Iterator[Note]:
     vault_root = vault_root.resolve()
     for dirpath, dirnames, filenames in os.walk(vault_root, followlinks=False):
         # Prune excluded directories in-place so os.walk doesn't descend
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if not _should_skip_dir(d)]
         for fname in filenames:
             if not fname.endswith(".md") or fname.startswith("."):
                 continue
@@ -158,3 +158,7 @@ def walk_vault(vault_root: Path) -> Iterator[Note]:
                 yield parse_note(path, vault_root)
             except (OSError, UnicodeDecodeError):
                 continue
+
+
+def _should_skip_dir(name: str) -> bool:
+    return name in EXCLUDE_DIRS or name.startswith(".") or name.endswith(".backup")

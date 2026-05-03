@@ -1,22 +1,25 @@
-"""edge-finder apply — read checked proposals, insert wikilinks into notes.
+"""edge-finder apply — read checked proposals and emit typed predicates.
 
-Format expected in proposals.md (this is also what --judge will produce):
+Accepted `proposals.md` formats during the migration:
+
+New directional format:
+
+    ## 1. `path/to/source.md` → `path/to/target.md`
+
+    - [ ] Apply: predicate=`co_topic`, confidence=high
+    - Evidence: "verbatim quote or deterministic evidence"
+    - Rationale: one-liner
+
+Legacy format still supported:
 
     ## 1. `path/to/source.md` ↔ `path/to/target.md`
 
     - [ ] Apply: edge_type=`discusses`, confidence=high
-    - Evidence: "verbatim quote from one of the bodies"
-    - Rationale: one-liner
 
-A checked box means "do it"; unchecked means skip. Apply inserts a
-single bullet under a `## Related` section in BOTH source and target
-(edges are undirected as far as the vault is concerned).
-
-Mutations are atomic per file and a tarball backup is written to
-`.edge-finder/backups/apply-<timestamp>.tar` before any file is touched.
-`apply --undo` extracts the most recent backup over the vault, with a
-hash check that aborts when the user has edited any of those files
-manually since the apply (use --force to override).
+Apply emits Dataview-style typed predicates using the composed ontology.
+The forward triple is always validated. Reverse emission only happens when
+the predicate is symmetric or its inverse is explicitly declared in the
+ontology.
 """
 from __future__ import annotations
 
@@ -30,21 +33,29 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-_HEADING_RE = re.compile(r"^##\s+\d+\.\s+`([^`]+)`\s*↔\s*`([^`]+)`\s*$", re.MULTILINE)
-_CHECKBOX_RE = re.compile(r"^\s*-\s+\[(.)\]\s+Apply:\s*edge_type=`([^`]+)`(?:,\s*confidence=(\w+))?\s*$", re.MULTILINE)
+from .ontology import Ontology, load_vault_ontology
+from .topology import build_graph
+from .triage import find_hubs
+from .typed_edges import infer_note_type, insert_typed_edge
+from .walker import Note, walk_vault
+
+_HEADING_RE = re.compile(r"^##\s+\d+\.\s+`([^`]+)`\s*(→|↔)\s*`([^`]+)`\s*$", re.MULTILINE)
+_CHECKBOX_RE = re.compile(
+    r"^\s*-\s+\[(.)\]\s+Apply:\s*(?:predicate|edge_type)=`([^`]+)`(?:,\s*confidence=(\w+))?\s*$",
+    re.MULTILINE,
+)
 _EVIDENCE_RE = re.compile(r"^\s*-\s+Evidence:\s*\"(.+?)\"\s*$", re.MULTILINE)
-_RELATED_HEADING_RE = re.compile(r"^##\s+Related\s*$", re.MULTILINE)
-_WIKILINK_RE = re.compile(r"\[\[([^\]\|\#]+)(?:#[^\]\|]+)?(?:\|[^\]]+)?\]\]")
 
 
 @dataclass
 class Proposal:
-    source: str           # relpath
-    target: str           # relpath
-    edge_type: str
+    source: str
+    target: str
+    predicate: str
     confidence: str = ""
     evidence: str = ""
     checked: bool = False
+    directional: bool = True
 
 
 @dataclass
@@ -74,11 +85,12 @@ def parse_proposals(proposals_md: str) -> list[Proposal]:
 
         out.append(Proposal(
             source=m.group(1).strip(),
-            target=m.group(2).strip(),
-            edge_type=cb.group(2).strip(),
+            target=m.group(3).strip(),
+            predicate=cb.group(2).strip(),
             confidence=(cb.group(3) or "").strip(),
             evidence=(ev.group(1).strip() if ev else ""),
             checked=cb.group(1).strip().lower() == "x",
+            directional=m.group(2) == "→",
         ))
     return out
 
@@ -98,12 +110,7 @@ def _build_basename_index(vault: Path) -> dict[str, list[str]]:
 
 
 def _wikilink_target(rel_path: str, basename_index: dict[str, list[str]] | None = None) -> str:
-    """Render the target form for a `[[wikilink]]`.
-
-    If the basename is unique in the vault, use it (`[[Foo]]`). If multiple
-    notes share the basename, qualify with the path so Obsidian doesn't
-    silently link to the wrong one (`[[Folder/Subfolder/Foo|Foo]]`).
-    """
+    """Render the target form for a `[[wikilink]]`."""
     name = Path(rel_path).name
     if name.endswith(".md"):
         name = name[:-3]
@@ -112,42 +119,21 @@ def _wikilink_target(rel_path: str, basename_index: dict[str, list[str]] | None 
     paths = basename_index.get(name, [])
     if len(paths) <= 1:
         return name
-    # Ambiguous — use the full path stem (without .md) and alias to the basename
     qualified = rel_path[:-3] if rel_path.endswith(".md") else rel_path
     return f"{qualified}|{name}"
 
 
-def _existing_wikilinks_in_section(section_text: str) -> set[str]:
-    return {m.group(1).strip().lower() for m in _WIKILINK_RE.finditer(section_text)}
-
-
-def _insert_related_link(body: str, link_target: str, edge_type: str) -> tuple[str, bool]:
-    """Insert a related-link bullet. Returns (new_body, did_insert)."""
-    bullet = f"- [[{link_target}]] — {edge_type}\n"
-
-    m = _RELATED_HEADING_RE.search(body)
-    if m:
-        # Find the body of the Related section: from end of heading line to next ## or EOF
-        section_start = m.end()
-        next_section = re.search(r"^#{1,6}\s+", body[section_start:], re.MULTILINE)
-        section_end = section_start + (next_section.start() if next_section else len(body) - section_start)
-        section_text = body[section_start:section_end]
-
-        # Skip if a wikilink to this target already exists in the section
-        existing = _existing_wikilinks_in_section(section_text)
-        if link_target.lower() in existing:
-            return body, False
-
-        # Insert at end of section, before next heading / EOF
-        # Ensure section ends with a newline before our insert
-        before = body[:section_end].rstrip() + "\n"
-        after = body[section_end:]
-        return before + bullet + ("\n" + after if after and not after.startswith("\n") else after), True
-
-    # No Related section yet — append one at end of file
-    sep = "" if body.endswith("\n") else "\n"
-    new_section = f"{sep}\n## Related\n\n{bullet}"
-    return body + new_section, True
+def _reverse_predicate(predicate: str, ontology: Ontology, *, directional: bool) -> str | None:
+    pred = ontology.predicates.get(predicate)
+    if not pred:
+        return None
+    if pred.symmetric:
+        return predicate
+    if not directional:
+        return predicate if predicate in ontology.predicates else None
+    if pred.inverse and pred.inverse in ontology.predicates:
+        return pred.inverse
+    return None
 
 
 def _sha256(data: bytes) -> str:
@@ -167,11 +153,6 @@ def _backup_vault(vault: Path, affected: set[Path]) -> Path:
 
 
 def _write_post_apply_manifest(backup_path: Path, vault: Path, affected: set[Path]) -> None:
-    """Write a sidecar JSON: relpath → sha256 of the file *after* apply.
-
-    On --undo we re-hash every file and abort if any has changed since,
-    so users don't silently lose manual edits made between apply and undo.
-    """
     manifest: dict[str, str] = {}
     for p in affected:
         if p.exists():
@@ -198,41 +179,62 @@ def apply_proposals(
     if not checked:
         return result
 
-    # Build a basename index once so we can disambiguate links into folders
-    # when two notes share a filename.
+    ontology = load_vault_ontology(vault)
+    notes = list(walk_vault(vault))
+    note_by_path = {n.relpath: n for n in notes}
+    graph, _ = build_graph(notes)
+    hub_paths = {h.relpath for h in find_hubs(notes, graph)}
     basename_index = _build_basename_index(vault)
 
-    # Group inserts by file: each proposal mutates BOTH source and target
-    # (related-link is undirected from a vault-browsing point of view).
     inserts_by_file: dict[Path, list[tuple[str, str]]] = {}
     for p in checked:
         src_path = vault / p.source
         dst_path = vault / p.target
-        if not src_path.exists():
+        src_note = note_by_path.get(p.source)
+        dst_note = note_by_path.get(p.target)
+        if not src_path.exists() or src_note is None:
             result.errors.append(f"source missing: {p.source}")
             continue
-        if not dst_path.exists():
+        if not dst_path.exists() or dst_note is None:
             result.errors.append(f"target missing: {p.target}")
             continue
+
+        src_type = infer_note_type(src_note, ontology, hub_paths=hub_paths)
+        dst_type = infer_note_type(dst_note, ontology, hub_paths=hub_paths)
+        valid, reason = ontology.validate_triple(src_type, p.predicate, dst_type)
+        if not valid:
+            result.errors.append(
+                f"schema rejected {p.source} {p.predicate} {p.target}: {reason}"
+            )
+            continue
+
         inserts_by_file.setdefault(src_path, []).append(
-            (_wikilink_target(p.target, basename_index), p.edge_type)
-        )
-        inserts_by_file.setdefault(dst_path, []).append(
-            (_wikilink_target(p.source, basename_index), p.edge_type)
+            (_wikilink_target(p.target, basename_index), p.predicate)
         )
 
-    # Plan first — compute what would actually change so we only back up files
-    # that will mutate. Re-running idempotently leaves no backup behind.
+        reverse = _reverse_predicate(p.predicate, ontology, directional=p.directional)
+        if not reverse:
+            continue
+        reverse_valid, reverse_reason = ontology.validate_triple(dst_type, reverse, src_type)
+        if not reverse_valid:
+            result.errors.append(
+                f"schema rejected {p.target} {reverse} {p.source}: {reverse_reason}"
+            )
+            continue
+        inserts_by_file.setdefault(dst_path, []).append(
+            (_wikilink_target(p.source, basename_index), reverse)
+        )
+
     planned: list[tuple[Path, str, list[tuple[str, str]]]] = []
     for path, inserts in inserts_by_file.items():
         original = path.read_text(encoding="utf-8")
         body = original
         actual_inserts: list[tuple[str, str]] = []
-        for target, etype in inserts:
-            new_body, inserted = _insert_related_link(body, target, etype)
+        for target, predicate in inserts:
+            new_body, inserted = insert_typed_edge(body, predicate, target)
             body = new_body
             if inserted:
-                actual_inserts.append((target, etype))
+                actual_inserts.append((target, predicate))
             else:
                 result.edges_skipped_existing += 1
         if actual_inserts:
@@ -240,9 +242,9 @@ def apply_proposals(
 
     if dry_run:
         for path, _new_body, inserts in planned:
-            for target, etype in inserts:
+            for target, predicate in inserts:
                 result.edges_added += 1
-                print(f"  [dry-run] {path.relative_to(vault)} ← [[{target}]] ({etype})")
+                print(f"  [dry-run] {path.relative_to(vault)} ← {predicate}:: [[{target}]]")
         return result
 
     if not planned:
@@ -258,9 +260,7 @@ def apply_proposals(
         result.files_touched += 1
         result.edges_added += len(inserts)
 
-    # Manifest written AFTER mutation so it captures the post-apply state.
     _write_post_apply_manifest(result.backup_path, vault, affected)
-
     return result
 
 
@@ -273,9 +273,6 @@ def undo_last_apply(vault: Path, *, force: bool = False) -> tuple[bool, str]:
         return False, "no apply backups available"
     latest = backups[-1]
 
-    # Hash-check current state against the post-apply manifest. If any file
-    # has been edited since the apply, refuse without --force so we don't
-    # silently destroy the user's manual edits.
     manifest_path = latest.with_suffix(".manifest.json")
     if manifest_path.exists() and not force:
         try:

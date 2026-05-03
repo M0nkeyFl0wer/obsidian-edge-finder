@@ -29,6 +29,8 @@ from pathlib import Path
 import networkx as nx
 
 from .stubs import StubInfo, find_stubs
+from .typed_edges import infer_note_type, insert_typed_edge
+from .ontology import load_vault_ontology
 from .topology import build_graph
 from .walker import Note, walk_vault
 
@@ -36,7 +38,6 @@ _HUB_NAME_RE = re.compile(r"\b(kanban|index|overview|hub|map|catalog|directory)\
 _NORM_RE = re.compile(r"[^a-z0-9]+")
 _HEADING_RE = re.compile(r"^##\s+\d+\.\s+`([^`]+)`\s*→\s*`([^`]+)`\s*$", re.MULTILINE)
 _CHECKBOX_RE = re.compile(r"^\s*-\s+\[(.)\]\s+Attach\b", re.MULTILINE)
-_SEE_ALSO_RE = re.compile(r"^##\s+See also\s*$", re.MULTILINE)
 
 
 def _norm(s: str) -> str:
@@ -89,7 +90,7 @@ def _is_hub_name(name: str) -> bool:
     return bool(_HUB_NAME_RE.search(name))
 
 
-_CONTENT_FOLDERS = {"books", "web-clips", "Clippings", "07_Bookmarks", "daily", "Daily"}
+_CONTENT_FOLDERS = {"books", "web-clips", "Clippings", "07_Bookmarks", "daily", "Daily", "Templates", "templates"}
 
 
 def find_hubs(notes: list[Note], graph: nx.Graph) -> list[Hub]:
@@ -210,7 +211,10 @@ def render_plan_md(plan: TriagePlan) -> str:
     for i, a in enumerate(plan.attachments, 1):
         parts.append(f"## {i}. `{a.stub_relpath}` → `{a.hub_relpath}`")
         parts.append("")
-        parts.append(f"- [x] Attach via tag `{a.matched_tag}` (confidence={a.confidence})")
+        parts.append(
+            f"- [x] Attach via predicate `topic_hub` from tag `{a.matched_tag}` "
+            f"(confidence={a.confidence})"
+        )
         parts.append("")
     parts.append("\n---\n")
     if plan.unattached:
@@ -246,8 +250,8 @@ def parse_plan(plan_md: str) -> list[HubAttach]:
         cb = _CHECKBOX_RE.search(block)
         if not cb or cb.group(1).strip().lower() != "x":
             continue
-        # Pull tag/confidence out of the bullet line for record-keeping
-        tag_match = re.search(r"`([^`]+)`\s*\(confidence=(\w+)\)", block)
+        # Pull tag/confidence out of the bullet line for record-keeping.
+        tag_match = re.search(r"from tag `([^`]+)`\s*\(confidence=(\w+)\)", block)
         out.append(HubAttach(
             stub_relpath=m.group(1).strip(),
             hub_relpath=m.group(2).strip(),
@@ -255,29 +259,6 @@ def parse_plan(plan_md: str) -> list[HubAttach]:
             confidence=tag_match.group(2) if tag_match else "high",
         ))
     return out
-
-
-def _insert_see_also(body: str, link_target: str) -> tuple[str, bool]:
-    """Add a wikilink to a `## See also` section. Idempotent.
-
-    Returns (new_body, did_insert). If the section already contains a
-    wikilink to the same target, returns the body unchanged.
-    """
-    bullet = f"- [[{link_target}]]\n"
-    m = _SEE_ALSO_RE.search(body)
-    if m:
-        section_start = m.end()
-        next_section = re.search(r"^#{1,6}\s+", body[section_start:], re.MULTILINE)
-        section_end = section_start + (next_section.start() if next_section else len(body) - section_start)
-        section_text = body[section_start:section_end]
-        if f"[[{link_target}]]" in section_text:
-            return body, False
-        before = body[:section_end].rstrip() + "\n"
-        after = body[section_end:]
-        return before + bullet + ("\n" + after if after and not after.startswith("\n") else after), True
-    sep = "" if body.endswith("\n") else "\n"
-    new_section = f"{sep}\n## See also\n\n{bullet}"
-    return body + new_section, True
 
 
 def _hub_link_target(hub_relpath: str, all_relpaths: set[str]) -> str:
@@ -338,6 +319,13 @@ def apply_plan(vault: Path, plan_md_path: Path, *, dry_run: bool = False) -> App
     if not attachments:
         return result
 
+    ontology = load_vault_ontology(vault)
+    notes = list(walk_vault(vault))
+    note_by_path = {n.relpath: n for n in notes}
+    graph, _ = build_graph(notes)
+    hub_paths = {h.relpath for h in find_hubs(notes, graph)}
+    predicate = "topic_hub"
+
     all_paths = {str(p.relative_to(vault)) for p in vault.rglob("*.md")
                  if not any(part.startswith(".") for part in p.relative_to(vault).parts)}
     affected = [vault / a.stub_relpath for a in attachments]
@@ -351,9 +339,22 @@ def apply_plan(vault: Path, plan_md_path: Path, *, dry_run: bool = False) -> App
         if not stub_path.exists():
             result.errors.append(f"stub missing: {a.stub_relpath}")
             continue
+        stub_note = note_by_path.get(a.stub_relpath)
+        hub_note = note_by_path.get(a.hub_relpath)
+        if stub_note is None or hub_note is None:
+            result.errors.append(f"note missing from scan index: {a.stub_relpath} → {a.hub_relpath}")
+            continue
+        subject_type = infer_note_type(stub_note, ontology, hub_paths=hub_paths)
+        object_type = infer_note_type(hub_note, ontology, hub_paths=hub_paths)
+        valid, reason = ontology.validate_triple(subject_type, predicate, object_type)
+        if not valid:
+            result.errors.append(
+                f"schema rejected {a.stub_relpath} {predicate} {a.hub_relpath}: {reason}"
+            )
+            continue
         body = stub_path.read_text(encoding="utf-8")
         link_target = _hub_link_target(a.hub_relpath, all_paths)
-        new_body, did = _insert_see_also(body, link_target)
+        new_body, did = insert_typed_edge(body, predicate, link_target)
         if did:
             result.edges_added += 1
             result.files_touched += 1
@@ -553,6 +554,13 @@ def apply_hub_creation(
     if not plans:
         return result
 
+    ontology = load_vault_ontology(vault)
+    notes = list(walk_vault(vault))
+    note_by_path = {n.relpath: n for n in notes}
+    graph, _ = build_graph(notes)
+    hub_paths = {h.relpath for h in find_hubs(notes, graph)}
+    predicate = "topic_hub"
+
     all_paths = {str(p.relative_to(vault)) for p in vault.rglob("*.md")
                  if not any(part.startswith(".") for part in p.relative_to(vault).parts)}
 
@@ -592,9 +600,20 @@ def apply_hub_creation(
             if not stub_path.exists():
                 result.errors.append(f"stub missing: {relpath}")
                 continue
+            stub_note = note_by_path.get(relpath)
+            if stub_note is None:
+                result.errors.append(f"note missing from scan index: {relpath}")
+                continue
+            subject_type = infer_note_type(stub_note, ontology, hub_paths=hub_paths)
+            valid, reason = ontology.validate_triple(subject_type, predicate, "hub")
+            if not valid:
+                result.errors.append(
+                    f"schema rejected {relpath} {predicate} {plan.hub_filename}: {reason}"
+                )
+                continue
             body = stub_path.read_text(encoding="utf-8")
             link_target = _hub_link_target(plan.hub_filename, all_paths | {plan.hub_filename})
-            new_body, did = _insert_see_also(body, link_target if link_target else hub_basename)
+            new_body, did = insert_typed_edge(body, predicate, link_target if link_target else hub_basename)
             if did:
                 result.edges_added += 1
                 if not dry_run:

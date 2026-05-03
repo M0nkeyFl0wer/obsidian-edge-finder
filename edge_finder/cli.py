@@ -13,6 +13,7 @@ from .cache import Cache
 from .fingerprint import build_fingerprint
 from .propose import plan, write_batch
 from .propose_holistic import plan_holistic
+from .propose_topology import plan_topology_proposals, write_topology_proposals_md
 from .report import render_report
 from .shapes import draft_ontology, summarize_shapes
 from .stubs import detect_stub_corpora
@@ -26,6 +27,7 @@ from .interview import (
     render_interview_md,
 )
 from .ontology import save_vault_ontology
+from .ontology import load_vault_ontology
 from .triage import apply_plan, run_create_hubs, run_plan, undo_last_triage
 from .verify import render_proposals_md, render_rejection_log, verify
 from .walker import walk_vault
@@ -154,6 +156,20 @@ def cmd_propose_plan(
     ontology = yaml.safe_load(onto_path.read_text())
     cache = Cache.load(vault / ".edge-finder" / "cache")
 
+    if mode == "topology":
+        print("\n==> ASSESS — topology-based open-triplet closure (no LLM)\n", file=sys.stderr)
+        print(f"vault: {vault}", file=sys.stderr)
+        print(f"  {len(notes)} notes parsed", file=sys.stderr)
+        composed = load_vault_ontology(vault)
+        proposals = plan_topology_proposals(notes, composed)
+        out_path = vault / "proposals.md"
+        write_topology_proposals_md(proposals, out_path)
+        print(f"  topology closures:    {len(proposals)}", file=sys.stderr)
+        print(f"\nwrote {out_path}", file=sys.stderr)
+        print("==> CONFIRM — review proposals.md, uncheck anything you don't want,", file=sys.stderr)
+        print(f"    then run: edge-finder apply {vault}\n", file=sys.stderr)
+        return 0
+
     if mode == "lean":
         print("\n==> ASSESS — TF-IDF candidate generation (no LLM, lean mode)\n", file=sys.stderr)
         print(f"vault: {vault}", file=sys.stderr)
@@ -244,7 +260,10 @@ def cmd_verify(vault_path: str) -> int:
     print(f"vault: {vault}", file=sys.stderr)
     print(f"reading: {raw_path}", file=sys.stderr)
 
-    ontology = yaml.safe_load(onto_path.read_text())
+    if (vault / ".edge-finder" / "ontology.yaml").exists():
+        ontology = load_vault_ontology(vault)
+    else:
+        ontology = yaml.safe_load(onto_path.read_text())
     result = verify(vault, raw_path, ontology)
 
     print(f"  total proposals:     {result.total}", file=sys.stderr)
@@ -393,6 +412,8 @@ def cmd_triage(
         print(f"\n==> CREATE-HUBS — {phase}\n", file=sys.stderr)
         print(f"vault: {vault}", file=sys.stderr)
         print(f"min stubs per tag: {min_tag_count}", file=sys.stderr)
+        if not (vault / ".edge-finder" / "ontology.yaml").exists():
+            print("  warning: no composed ontology found; using universal core only", file=sys.stderr)
         plans, result = run_create_hubs(vault, min_tag_count=min_tag_count, dry_run=dry_run)
         if not plans:
             print(
@@ -426,6 +447,8 @@ def cmd_triage(
         if not plan_path.exists():
             print(f"error: {plan_path} not found — run `edge-finder triage` first", file=sys.stderr)
             return 1
+        if not (vault / ".edge-finder" / "ontology.yaml").exists():
+            print("  warning: no composed ontology found; using universal core only", file=sys.stderr)
         result = apply_plan(vault, plan_path, dry_run=dry_run)
         print(f"  attachments checked: {result.proposals_checked}", file=sys.stderr)
         print(f"  edges added:         {result.edges_added}", file=sys.stderr)
@@ -480,8 +503,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="assess + plan candidates only (no LLM call)")
     propose.add_argument("--judge", action="store_true",
                          help="run the LLM judgment step (not yet implemented)")
-    propose.add_argument("--mode", choices=["holistic", "lean"], default="holistic",
-                         help="holistic: structured-index → Claude (default); lean: TF-IDF + per-pair judgment")
+    propose.add_argument("--mode", choices=["holistic", "lean", "topology"], default="holistic",
+                         help="holistic: structured-index → Claude (default); lean: TF-IDF + per-pair judgment; topology: deterministic triplet closure")
     propose.add_argument("-k", type=int, default=10,
                          help="(lean only) max candidates per source note")
     propose.add_argument("--budget", type=int, default=None,

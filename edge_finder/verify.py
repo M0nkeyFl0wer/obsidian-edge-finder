@@ -23,6 +23,8 @@ from pathlib import Path
 
 import yaml
 
+from .ontology import Ontology
+
 
 @dataclass
 class RawProposal:
@@ -69,8 +71,12 @@ def _read_body(vault: Path, relpath: str) -> str | None:
         return None
 
 
-def _allowed_edge_types(ontology: dict) -> set[str]:
-    return {e.get("name") for e in ontology.get("edge_types", []) if e.get("name")}
+def _allowed_edge_types(ontology: dict | Ontology) -> set[str]:
+    if isinstance(ontology, Ontology):
+        return set(ontology.predicates)
+    names = {e.get("name") for e in ontology.get("edge_types", []) if e.get("name")}
+    names.update(p.get("name") for p in ontology.get("predicates", []) if p.get("name"))
+    return names
 
 
 def verify(
@@ -174,9 +180,9 @@ def render_proposals_md(result: VerifyResult) -> str:
         "",
     ]
     for i, p in enumerate(result.accepted_proposals, 1):
-        parts.append(f"## {i}. `{p.source}` ↔ `{p.target}`")
+        parts.append(f"## {i}. `{p.source}` → `{p.target}`")
         parts.append("")
-        parts.append(f"- [ ] Apply: edge_type=`{p.edge_type}`, confidence={p.confidence}")
+        parts.append(f"- [ ] Apply: predicate=`{p.edge_type}`, confidence={p.confidence}")
         parts.append(f"- Evidence: \"{p.evidence_quote}\"")
         if p.rationale:
             parts.append(f"- Rationale: {p.rationale}")
