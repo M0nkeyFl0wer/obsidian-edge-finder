@@ -82,7 +82,7 @@ def _allowed_edge_types(ontology: dict | Ontology) -> set[str]:
 def verify(
     vault: Path,
     raw_yaml_path: Path,
-    ontology: dict,
+    ontology: dict[str, object],
 ) -> VerifyResult:
     result = VerifyResult()
     if not raw_yaml_path.exists():

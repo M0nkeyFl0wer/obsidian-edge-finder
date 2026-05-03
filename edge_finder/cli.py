@@ -12,7 +12,7 @@ from .apply import apply_proposals, undo_last_apply
 from .cache import Cache
 from .fingerprint import build_fingerprint
 from .propose import plan, write_batch
-from .propose_holistic import plan_holistic
+from .propose_holistic import HolisticPlanResult, plan_holistic
 from .propose_topology import plan_topology_proposals, write_topology_proposals_md
 from .report import render_report
 from .shapes import draft_ontology, summarize_shapes
@@ -177,19 +177,19 @@ def cmd_propose_plan(
         print(f"  cache: {len(cache.fingerprints)} fingerprints, {len(cache.verdicts)} prior verdicts", file=sys.stderr)
         print("\n==> PLAN — assembling candidate edges\n", file=sys.stderr)
 
-        result = plan(
+        plan_result = plan(
             notes=notes, by_path_type=by_path, ontology=ontology, cache=cache,
             k=k, min_score=min_score, budget=budget, strict=strict,
         )
         batch_path = vault / "judgment-batch.md"
-        write_batch(result, notes, ontology, batch_path)
+        write_batch(plan_result, notes, ontology, batch_path)
 
-        print(f"  candidates:           {len(result.candidates)}", file=sys.stderr)
-        print(f"  source notes scanned: {result.n_source_notes}", file=sys.stderr)
-        print(f"  dropped (thin overlap): {result.n_skipped_thin_overlap}", file=sys.stderr)
-        print(f"  estimated tokens:     ~{result.estimated_tokens:,}", file=sys.stderr)
+        print(f"  candidates:           {len(plan_result.candidates)}", file=sys.stderr)
+        print(f"  source notes scanned: {plan_result.n_source_notes}", file=sys.stderr)
+        print(f"  dropped (thin overlap): {plan_result.n_skipped_thin_overlap}", file=sys.stderr)
+        print(f"  estimated tokens:     ~{plan_result.estimated_tokens:,}", file=sys.stderr)
         print(f"\nwrote {batch_path}", file=sys.stderr)
-        print(_art.render(_art.PROPOSE_COMPLETE, n=len(result.candidates)), file=sys.stderr)
+        print(_art.render(_art.PROPOSE_COMPLETE, n=len(plan_result.candidates)), file=sys.stderr)
         print("==> CONFIRM — review judgment-batch.md, delete unwanted candidates,", file=sys.stderr)
         print("    then run: edge-finder propose --judge\n", file=sys.stderr)
         return 0
@@ -215,27 +215,28 @@ def cmd_propose_plan(
     ]
 
     print("\n==> PLAN — assembling judgment batch for --judge\n", file=sys.stderr)
-    result, prompt_text = plan_holistic(
+    holistic_result: HolisticPlanResult
+    holistic_result, prompt_text = plan_holistic(
         notes=notes, fingerprints=fingerprints, ontology=ontology, cache=cache,
     )
 
     batch_path = vault / "judgment-batch.md"
     batch_path.write_text(prompt_text, encoding="utf-8")
 
-    print(f"  notes in index:           {result.n_notes}", file=sys.stderr)
-    print(f"  with structured signal:   {result.n_with_signal}", file=sys.stderr)
-    print(f"  sparse (body-snippet only): {result.n_sparse}", file=sys.stderr)
-    print(f"  existing edges (context): {result.existing_edges}", file=sys.stderr)
-    print(f"  estimated prompt tokens:  ~{result.estimated_tokens:,}", file=sys.stderr)
-    if result.fits_in_sonnet:
+    print(f"  notes in index:           {holistic_result.n_notes}", file=sys.stderr)
+    print(f"  with structured signal:   {holistic_result.n_with_signal}", file=sys.stderr)
+    print(f"  sparse (body-snippet only): {holistic_result.n_sparse}", file=sys.stderr)
+    print(f"  existing edges (context): {holistic_result.existing_edges}", file=sys.stderr)
+    print(f"  estimated prompt tokens:  ~{holistic_result.estimated_tokens:,}", file=sys.stderr)
+    if holistic_result.fits_in_sonnet:
         fit = "Sonnet 200k context (comfortable)"
-    elif result.fits_in_opus:
+    elif holistic_result.fits_in_opus:
         fit = "Opus 1M context (only)"
     else:
         fit = "EXCEEDS Opus 1M — chunking needed"
     print(f"  context fit:              {fit}", file=sys.stderr)
     print(f"\nwrote {batch_path}", file=sys.stderr)
-    print(_art.render(_art.PROPOSE_COMPLETE, n=result.n_notes), file=sys.stderr)
+    print(_art.render(_art.PROPOSE_COMPLETE, n=holistic_result.n_notes), file=sys.stderr)
     print("==> CONFIRM — review judgment-batch.md (this is the EXACT prompt --judge will send),", file=sys.stderr)
     print("    edit / delete sections you don't want, then run: edge-finder propose --judge\n", file=sys.stderr)
     return 0
@@ -261,10 +262,10 @@ def cmd_verify(vault_path: str) -> int:
     print(f"reading: {raw_path}", file=sys.stderr)
 
     if (vault / ".edge-finder" / "ontology.yaml").exists():
-        ontology = load_vault_ontology(vault)
+        onto_dict: dict[str, object] = load_vault_ontology(vault)  # type: ignore[assignment]
     else:
-        ontology = yaml.safe_load(onto_path.read_text())
-    result = verify(vault, raw_path, ontology)
+        onto_dict = yaml.safe_load(onto_path.read_text())
+    result = verify(vault, raw_path, onto_dict)
 
     print(f"  total proposals:     {result.total}", file=sys.stderr)
     print(f"  accepted:            {result.accepted}", file=sys.stderr)

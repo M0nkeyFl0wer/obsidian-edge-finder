@@ -140,7 +140,7 @@ def plan(
         for dst_path, score in topk:
             if added >= k:
                 break
-            pair = tuple(sorted((src.relpath, dst_path)))
+            pair: tuple[str, str] = tuple(sorted((src.relpath, dst_path)))  # type: ignore[assignment]
             if pair in seen_pairs:
                 continue
             if pair in existing:
